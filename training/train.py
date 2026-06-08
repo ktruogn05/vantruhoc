@@ -1,50 +1,47 @@
-"""Training pipeline — MaskablePPO on LLMEnvSimple."""
+"""Training pipeline - MaskablePPO on LLMEnvSimple."""
 
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    str(Path(tempfile.gettempdir()) / "matplotlib-cache"),
+)
+
 from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import CheckpointCallback
 
 from configs.default import TrainingConfig
-from core.workload import WorkloadGenerator
-from env.llm_env import LLMEnvSimple
 from env.sb3_wrapper import SB3EnvWrapper
+from training.env_factory import build_sb3_env
 
 
-def make_env(config: TrainingConfig) -> SB3EnvWrapper:
+def make_env(config: TrainingConfig, seed: int | None = None) -> SB3EnvWrapper:
     """Create wrapped environment from config."""
-    wg = WorkloadGenerator(
-        arrival_rate=config.workload.arrival_rate,
-        seed=config.workload.seed,
-    )
-    wg.set_distributions(
-        prompt_len=config.workload.prompt_len,
-        response_len=config.workload.response_len,
-        priority_weights=config.workload.priority_weights,
-        deadline_slack=config.workload.deadline_slack,
-    )
-    raw_env = LLMEnvSimple(
-        workload_generator=wg,
-        reward_weights=config.reward_weights,
-    )
-    return SB3EnvWrapper(raw_env)
+    return build_sb3_env(config.workload, config.reward_weights, seed=seed)
 
 
 def train(config: TrainingConfig | None = None) -> Path:
-    """Train MaskablePPO. Returns path to saved model."""
+    """Train MaskablePPO and return the saved model path."""
     if config is None:
         config = TrainingConfig()
 
-    # Wrap in standard DummyVecEnv and VecNormalize for stable dynamic reward scaling
-    env = DummyVecEnv([lambda: make_env(config)])
+    save_dir = Path(config.save_dir)
+    log_dir = Path(config.log_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    env = DummyVecEnv([lambda: Monitor(make_env(config))])
     env = VecNormalize(env, norm_obs=False, norm_reward=True)
 
-    os.makedirs(config.save_dir, exist_ok=True)
-    os.makedirs(config.log_dir, exist_ok=True)
+    eval_env = DummyVecEnv([lambda: Monitor(make_env(config, seed=config.eval_seed))])
+    eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
 
     model = MaskablePPO(
         "MlpPolicy",
@@ -61,23 +58,38 @@ def train(config: TrainingConfig | None = None) -> Path:
         max_grad_norm=config.max_grad_norm,
         policy_kwargs={"net_arch": config.net_arch},
         verbose=1,
-        tensorboard_log=config.log_dir,
+        tensorboard_log=str(log_dir),
     )
 
-    checkpoint_cb = CheckpointCallback(
-        save_freq=config.save_freq,
-        save_path=config.save_dir,
-        name_prefix="llm_scheduler",
+    callbacks = CallbackList(
+        [
+            CheckpointCallback(
+                save_freq=config.save_freq,
+                save_path=str(save_dir),
+                name_prefix="llm_scheduler",
+            ),
+            MaskableEvalCallback(
+                eval_env,
+                best_model_save_path=str(save_dir / "best"),
+                log_path=str(log_dir / "eval"),
+                eval_freq=config.eval_freq,
+                n_eval_episodes=config.n_eval_episodes,
+                deterministic=True,
+            ),
+        ]
     )
 
     model.learn(
         total_timesteps=config.total_timesteps,
-        callback=checkpoint_cb,
+        callback=callbacks,
         progress_bar=True,
+        log_interval=config.log_interval,
     )
 
-    save_path = Path(config.save_dir) / "llm_scheduler_final"
+    save_path = save_dir / "llm_scheduler_final"
     model.save(str(save_path))
+    env.save(str(save_dir / "vecnormalize.pkl"))
     print(f"Model saved to {save_path}")
+    print(f"VecNormalize stats saved to {save_dir / 'vecnormalize.pkl'}")
 
     return save_path

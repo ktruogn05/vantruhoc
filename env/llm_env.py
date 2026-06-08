@@ -1,16 +1,21 @@
-"""LLMEnvSimple — 4-phase Gymnasium environment implementing env_simple.md spec."""
+"""LLMEnvSimple - token-based Gymnasium environment."""
 
 from __future__ import annotations
+
+from math import ceil
 
 import gymnasium
 
 from core.constants import (
     BATCH_MAX_SIZE,
     CLIENT_TIMEOUT_AFTER_DEADLINE,
-    GPU_VRAM_MAX_TOKENS,
     CPU_RAM_MAX_TOKENS,
+    GPU_DECODE_TOKENS_PER_STEP,
+    GPU_VRAM_MAX_TOKENS,
     MAX_CONCURRENT_PREFILL,
     MAX_EPISODE_STEPS,
+    PREFILL_DECODE_SLOT_COST,
+    PREFILL_TOKENS_PER_STEP,
     SWAP_IN_DELAY,
 )
 from core.types import (
@@ -31,8 +36,10 @@ from env.reward import RewardCalculator, RewardWeights
 class LLMEnvSimple(gymnasium.Env):
     """Token-based LLM serving simulator.
 
-    Implements the exact 4-phase step loop from env_simple.md.
-    Works with SchedulerAction structs — encoding/decoding is external.
+    The environment keeps the original high-level phases but avoids the most
+    misleading shortcuts: prefill has prompt-dependent latency, decode has a
+    per-step compute budget, timeout applies to all unfinished requests, and
+    episode metrics include unfinished backlog.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -41,22 +48,19 @@ class LLMEnvSimple(gymnasium.Env):
         self,
         workload_generator: WorkloadGenerator,
         reward_weights: RewardWeights | None = None,
+        max_episode_steps: int = MAX_EPISODE_STEPS,
     ):
         super().__init__()
         self._wg = workload_generator
         self._memory = MemoryPool(GPU_VRAM_MAX_TOKENS, CPU_RAM_MAX_TOKENS)
         self._reward_calc = RewardCalculator(reward_weights)
         self._metrics = MetricsCollector()
+        self._max_episode_steps = max_episode_steps
 
-        # State
         self._active_batch: list[Request] = []
         self._queue: list[Request] = []
         self._preempted_queue: list[Request] = []
         self._current_time: int = 0
-
-    # ------------------------------------------------------------------
-    # Gymnasium interface
-    # ------------------------------------------------------------------
 
     def reset(
         self, *, seed: int | None = None, options: dict | None = None
@@ -69,92 +73,62 @@ class LLMEnvSimple(gymnasium.Env):
         self._preempted_queue.clear()
         self._current_time = 0
 
-        reset_seed = seed if seed is not None else 42
-        self._wg.reset(seed=reset_seed)
-
-        # Generate initial arrivals at t=0
-        arrivals = self._wg.generate_arrivals(self._current_time)
-        self._queue.extend(arrivals)
+        self._wg.reset(seed=seed)
+        self._add_arrivals(self._current_time)
 
         return self.state_snapshot, {}
 
     def step(
         self, action: SchedulerAction
     ) -> tuple[dict, float, bool, bool, dict]:
-        """Execute 4 phases per env_simple.md."""
+        """Execute one scheduling step."""
+        step_time = self._current_time
 
-        # Accumulators for this step
-        p_abort = 0.0
         p_recompute = 0.0
-        p_oom = 0.0
-        p_cpu_overflow = 0.0
+        p_oom = 0
+        p_cpu_overflow = 0
+        abort_priority_sum = 0.0
 
-        # ── Phase 1: Execute scheduler action ──
         phase1 = self._execute_action(action)
-        p_abort += phase1["abort"]
         p_recompute += phase1["recompute"]
-        p_oom += phase1["oom"]
         p_cpu_overflow += phase1["cpu_overflow"]
 
-        # ── Phase 2: GPU processing ──
         phase2 = self._process_gpu()
         tokens_decoded = phase2["tokens_decoded"]
         p_oom += phase2["oom"]
 
-        # ── Phase 3: Completion, timeout, time advance ──
         phase3 = self._post_process()
-        p_abort += phase3["abort"]
+        abort_priority_sum += phase3["abort_priority_sum"]
 
-        # SLA check: fires at t == d_k + 1
-        sla_sum = self._check_sla_violations()
+        sla_priority_sum = self._check_sla_violations(step_time)
 
-        # Time advance
+        wait_sum = self._queued_wait_sum(step_time)
+
         self._current_time += 1
+        if not self._hit_time_limit():
+            self._add_arrivals(self._current_time)
 
-        # New arrivals
-        arrivals = self._wg.generate_arrivals(self._current_time)
-        self._queue.extend(arrivals)
-
-        # Episode termination
         terminated = self._is_episode_done()
         truncated = False
-
-        # ── Phase 4: Reward ──
-        # Wait penalty: sum of (t - a_i) for all requests in queues
-        wait_sum = 0.0
-        for r in self._queue:
-            wait_sum += self._current_time - r.arrival_time
-        for r in self._preempted_queue:
-            wait_sum += self._current_time - r.arrival_time
-
-        # Crash penalty at terminal step
-        crash_sum = 0.0
-        if terminated and self._current_time >= MAX_EPISODE_STEPS:
-            for r in self._active_batch:
-                crash_sum += r.priority
-            for r in self._queue:
-                crash_sum += r.priority
-            for r in self._preempted_queue:
-                crash_sum += r.priority
+        crash_sum = self._unfinished_priority_sum() if self._hit_time_limit() else 0.0
 
         reward = self._reward_calc.compute(
             tokens_decoded=tokens_decoded,
             wait_sum=wait_sum,
-            sla_sum=sla_sum,
-            abort_sum=p_abort,
+            sla_sum=sla_priority_sum,
+            abort_sum=abort_priority_sum,
             recompute_sum=p_recompute,
-            oom_count=int(p_oom),
-            cpu_overflow_count=int(p_cpu_overflow / 50.0) if p_cpu_overflow > 0 else 0,
+            oom_count=p_oom,
+            cpu_overflow_count=p_cpu_overflow,
             crash_sum=crash_sum,
         )
 
-        # Metrics
         self._metrics.on_step(tokens_decoded)
         step_metrics = StepMetrics(
             tokens_decoded=tokens_decoded,
             requests_completed=phase3["completed"],
             requests_aborted=phase3["aborted"],
-            sla_violations=int(sla_sum > 0),
+            sla_violations=int(sla_priority_sum > 0),
             oom_events=int(p_oom > 0),
             active_batch_size=len(self._active_batch),
             queue_size=len(self._queue),
@@ -165,18 +139,18 @@ class LLMEnvSimple(gymnasium.Env):
 
         info = {
             "step_metrics": step_metrics,
-            "episode_metrics": self._metrics.get_summary() if terminated else None,
+            "episode_metrics": (
+                self._metrics.get_summary(self._unfinished_count())
+                if terminated
+                else None
+            ),
         }
 
         return self.state_snapshot, reward, terminated, truncated, info
 
-    # ------------------------------------------------------------------
-    # State snapshot
-    # ------------------------------------------------------------------
-
     @property
     def state_snapshot(self) -> dict:
-        """Read-only snapshot for observation encoder / baseline schedulers."""
+        """Read-only snapshot for observation encoder and schedulers."""
         return {
             "active_batch": list(self._active_batch),
             "queue": list(self._queue),
@@ -188,31 +162,28 @@ class LLMEnvSimple(gymnasium.Env):
             "current_time": self._current_time,
         }
 
-    # ------------------------------------------------------------------
-    # Phase 1: Execute scheduler action
-    # ------------------------------------------------------------------
+    def _add_arrivals(self, current_time: int) -> None:
+        arrivals = self._wg.generate_arrivals(current_time)
+        self._queue.extend(arrivals)
+        self._metrics.on_requests_arrived(len(arrivals))
 
     def _execute_action(self, action: SchedulerAction) -> dict:
-        penalties = {"abort": 0.0, "recompute": 0.0, "oom": 0.0, "cpu_overflow": 0.0}
+        penalties = {"recompute": 0.0, "cpu_overflow": 0}
 
         if action.action_type == ActionType.PROMOTE:
             self._execute_promote(action.indices)
         elif action.action_type == ActionType.PREEMPT:
-            p = self._execute_preempt(action.indices, action.preempt_strategy)
-            penalties["recompute"] += p["recompute"]
-            penalties["cpu_overflow"] += p["cpu_overflow"]
+            penalties = self._execute_preempt(action.indices, action.preempt_strategy)
         elif action.action_type == ActionType.RESUME:
             self._execute_resume(action.indices)
-        # NOOP: do nothing
 
         return penalties
 
     def _execute_promote(self, indices: list[int]) -> None:
-        """Promote requests from queue to active batch."""
         prefills_this_step = self._count_prefills_this_step()
+        promoted: list[tuple[int, Request]] = []
 
-        # Sort descending to avoid index shifting on removal
-        for idx in sorted(indices, reverse=True):
+        for idx in indices:
             if idx < 0 or idx >= len(self._queue):
                 continue
             if len(self._active_batch) >= BATCH_MAX_SIZE:
@@ -224,45 +195,39 @@ class LLMEnvSimple(gymnasium.Env):
             if not self._memory.gpu_alloc(req.prompt_tokens):
                 continue
 
-            # Success — move to active batch
             req.stage = RequestStage.PREFILL
+            req.prefill_remaining = self._prefill_steps(req.prompt_tokens)
             req.tokens_generated = 0
+            req.ttft = None
+            promoted.append((idx, req))
             self._active_batch.append(req)
-            self._queue.pop(idx)
             prefills_this_step += 1
+
+        for idx, _ in sorted(promoted, key=lambda item: item[0], reverse=True):
+            self._queue.pop(idx)
 
     def _execute_preempt(
         self, indices: list[int], strategy: PreemptStrategy
     ) -> dict:
-        """Preempt requests from active batch."""
-        penalties = {"recompute": 0.0, "cpu_overflow": 0.0}
-
-        # Collect valid requests first, then remove (avoid index shifting)
+        penalties = {"recompute": 0.0, "cpu_overflow": 0}
         to_remove = []
-        for idx in indices:
+
+        for idx in sorted(set(indices)):
             if idx < 0 or idx >= len(self._active_batch):
                 continue
             req = self._active_batch[idx]
-
-            # Cannot preempt PREFILL (atomic)
             if req.stage == RequestStage.PREFILL:
                 continue
 
             if req.stage == RequestStage.SWAP_IN_DEGRADED:
-                # Free GPU VRAM
                 self._memory.gpu_free_tokens(req.total_tokens)
-
                 if strategy == PreemptStrategy.RECOMPUTE:
-                    # Free CPU RAM
                     self._memory.cpu_free_tokens(req.cpu_tokens_held)
                     req.cpu_tokens_held = 0
                     req.preempted_label = PreemptedLabel.RECOMPUTE_WAITING
-                    penalties["recompute"] += 1.0 * req.tokens_generated
-                else:  # SWAP
-                    # CPU RAM stays, label as swapped
+                    penalties["recompute"] += float(req.tokens_generated)
+                else:
                     req.preempted_label = PreemptedLabel.SWAPPED_TO_CPU
-                    # cpu_tokens_held remains
-
                 req.stage = None
                 req.swap_in_remaining = 0
                 self._preempted_queue.append(req)
@@ -271,43 +236,39 @@ class LLMEnvSimple(gymnasium.Env):
             elif req.stage == RequestStage.DECODE:
                 if strategy == PreemptStrategy.RECOMPUTE:
                     self._memory.gpu_free_tokens(req.total_tokens)
-                    penalties["recompute"] += 1.0 * req.tokens_generated
+                    penalties["recompute"] += float(req.tokens_generated)
                     req.tokens_generated = 0
+                    req.prefill_remaining = 0
                     req.preempted_label = PreemptedLabel.RECOMPUTE_WAITING
                     req.stage = None
                     self._preempted_queue.append(req)
                     to_remove.append(idx)
-                else:  # SWAP
-                    if not self._memory.cpu_alloc(req.total_tokens):
-                        # Swap fails — request stays in batch
-                        penalties["cpu_overflow"] += 50.0
-                    else:
-                        self._memory.gpu_free_tokens(req.total_tokens)
-                        req.cpu_tokens_held = req.total_tokens
-                        req.preempted_label = PreemptedLabel.SWAPPED_TO_CPU
-                        req.stage = None
-                        self._preempted_queue.append(req)
-                        to_remove.append(idx)
+                elif self._memory.cpu_alloc(req.total_tokens):
+                    self._memory.gpu_free_tokens(req.total_tokens)
+                    req.cpu_tokens_held = req.total_tokens
+                    req.preempted_label = PreemptedLabel.SWAPPED_TO_CPU
+                    req.stage = None
+                    self._preempted_queue.append(req)
+                    to_remove.append(idx)
+                else:
+                    penalties["cpu_overflow"] += 1
 
-        # Remove from active batch (descending order)
         for idx in sorted(to_remove, reverse=True):
             self._active_batch.pop(idx)
 
         return penalties
 
     def _execute_resume(self, indices: list[int]) -> None:
-        """Resume requests from preempted queue."""
         prefills_this_step = self._count_prefills_this_step()
         to_remove = []
 
-        for idx in sorted(indices, reverse=True):
+        for idx in indices:
             if idx < 0 or idx >= len(self._preempted_queue):
                 continue
             if len(self._active_batch) >= BATCH_MAX_SIZE:
                 continue
 
             req = self._preempted_queue[idx]
-
             if req.preempted_label == PreemptedLabel.RECOMPUTE_WAITING:
                 if prefills_this_step >= MAX_CONCURRENT_PREFILL:
                     continue
@@ -315,6 +276,7 @@ class LLMEnvSimple(gymnasium.Env):
                     continue
 
                 req.stage = RequestStage.PREFILL
+                req.prefill_remaining = self._prefill_steps(req.prompt_tokens)
                 req.tokens_generated = 0
                 req.preempted_label = None
                 self._active_batch.append(req)
@@ -330,110 +292,148 @@ class LLMEnvSimple(gymnasium.Env):
                 req.preempted_label = None
                 self._active_batch.append(req)
                 to_remove.append(idx)
-                # CPU RAM stays until swap-in completes
 
         for idx in sorted(to_remove, reverse=True):
             self._preempted_queue.pop(idx)
 
-    def _count_prefills_this_step(self) -> int:
-        """Count requests currently in PREFILL stage (just promoted this step)."""
-        return sum(
-            1 for r in self._active_batch if r.stage == RequestStage.PREFILL
-        )
-
-    # ------------------------------------------------------------------
-    # Phase 2: GPU processing
-    # ------------------------------------------------------------------
-
     def _process_gpu(self) -> dict:
         tokens_decoded = 0
         oom_count = 0
+        prefill_slots_used = 0
+        decode_next_step: set[int] = set()
 
         for req in self._active_batch:
-            if req.stage == RequestStage.PREFILL:
-                # Process prompt. No token generated this step.
+            if req.stage != RequestStage.PREFILL:
+                continue
+            req.prefill_remaining -= 1
+            prefill_slots_used += PREFILL_DECODE_SLOT_COST
+            if req.prefill_remaining <= 0:
+                req.prefill_remaining = 0
                 req.ttft = self._current_time - req.arrival_time + 1
                 req.stage = RequestStage.DECODE
+                decode_next_step.add(req.id)
 
-            elif req.stage == RequestStage.SWAP_IN_DEGRADED:
-                req.swap_in_remaining -= 1
-                if req.swap_in_remaining == 0:
-                    req.stage = RequestStage.DECODE
-                    # Release CPU RAM
-                    self._memory.cpu_free_tokens(req.cpu_tokens_held)
-                    req.cpu_tokens_held = 0
+        for req in self._active_batch:
+            if req.stage != RequestStage.SWAP_IN_DEGRADED:
+                continue
+            req.swap_in_remaining -= 1
+            if req.swap_in_remaining <= 0:
+                req.swap_in_remaining = 0
+                req.stage = RequestStage.DECODE
+                self._memory.cpu_free_tokens(req.cpu_tokens_held)
+                req.cpu_tokens_held = 0
+                decode_next_step.add(req.id)
 
-            elif req.stage == RequestStage.DECODE:
-                # Try to generate 1 token
-                if self._memory.gpu_used + 1 > GPU_VRAM_MAX_TOKENS:
-                    # OOM — skip token generation this step
-                    oom_count += 1
-                else:
-                    self._memory.gpu_used += 1
-                    req.tokens_generated += 1
-                    tokens_decoded += 1
+        decode_budget = max(0, GPU_DECODE_TOKENS_PER_STEP - prefill_slots_used)
+        for req in self._active_batch:
+            if decode_budget <= 0:
+                break
+            if req.stage != RequestStage.DECODE:
+                continue
+            if req.id in decode_next_step:
+                continue
+            if self._memory.gpu_used + 1 > GPU_VRAM_MAX_TOKENS:
+                oom_count += 1
+                continue
+            self._memory.gpu_used += 1
+            req.tokens_generated += 1
+            tokens_decoded += 1
+            decode_budget -= 1
 
         return {"tokens_decoded": tokens_decoded, "oom": oom_count}
-
-    # ------------------------------------------------------------------
-    # Phase 3: Completion, timeout, time advance
-    # ------------------------------------------------------------------
 
     def _post_process(self) -> dict:
         completed = 0
         aborted = 0
-        abort_penalty = 0.0
+        abort_priority_sum = 0.0
 
-        # Check completions
-        remaining = []
+        remaining_active = []
         for req in self._active_batch:
             if req.is_complete:
-                self._memory.gpu_free_tokens(req.total_tokens)
+                self._free_request_memory(req)
                 self._metrics.on_request_complete(req, self._current_time)
                 completed += 1
             else:
-                remaining.append(req)
-        self._active_batch = remaining
+                remaining_active.append(req)
+        self._active_batch = remaining_active
 
-        # Client timeout — scan queue and preempted_queue
-        def timeout_filter(req_list: list[Request]) -> list[Request]:
-            nonlocal aborted, abort_penalty
-            kept = []
-            for req in req_list:
-                if self._current_time - req.deadline > CLIENT_TIMEOUT_AFTER_DEADLINE:
-                    # Abort
-                    if req.preempted_label == PreemptedLabel.SWAPPED_TO_CPU:
-                        self._memory.cpu_free_tokens(req.cpu_tokens_held)
-                    abort_penalty += 20.0 * req.priority
-                    self._metrics.on_request_abort(req)
-                    aborted += 1
-                else:
-                    kept.append(req)
-            return kept
+        self._active_batch, active_aborted, active_priority = self._abort_timed_out(
+            self._active_batch
+        )
+        self._queue, queue_aborted, queue_priority = self._abort_timed_out(self._queue)
+        self._preempted_queue, preempted_aborted, preempted_priority = (
+            self._abort_timed_out(self._preempted_queue)
+        )
 
-        self._queue = timeout_filter(self._queue)
-        self._preempted_queue = timeout_filter(self._preempted_queue)
+        aborted = active_aborted + queue_aborted + preempted_aborted
+        abort_priority_sum = active_priority + queue_priority + preempted_priority
 
         return {
             "completed": completed,
             "aborted": aborted,
-            "abort": abort_penalty,
+            "abort_priority_sum": abort_priority_sum,
         }
 
-    def _check_sla_violations(self) -> float:
-        """P_SLA: fires at t == d_k + 1 for all requests everywhere."""
+    def _abort_timed_out(self, requests: list[Request]) -> tuple[list[Request], int, float]:
+        kept = []
+        aborted = 0
+        priority_sum = 0.0
+        for req in requests:
+            if self._current_time - req.deadline > CLIENT_TIMEOUT_AFTER_DEADLINE:
+                self._free_request_memory(req)
+                self._metrics.on_request_abort(req)
+                aborted += 1
+                priority_sum += req.priority
+            else:
+                kept.append(req)
+        return kept, aborted, priority_sum
+
+    def _free_request_memory(self, req: Request) -> None:
+        if req.stage in (
+            RequestStage.PREFILL,
+            RequestStage.SWAP_IN_DEGRADED,
+            RequestStage.DECODE,
+        ):
+            self._memory.gpu_free_tokens(req.total_tokens)
+        if req.cpu_tokens_held > 0:
+            self._memory.cpu_free_tokens(req.cpu_tokens_held)
+            req.cpu_tokens_held = 0
+
+    def _check_sla_violations(self, step_time: int) -> float:
         sla_sum = 0.0
-        all_requests = (
-            list(self._active_batch)
-            + list(self._queue)
-            + list(self._preempted_queue)
-        )
-        for req in all_requests:
-            if self._current_time == req.deadline + 1:
+        for req in self._unfinished_requests():
+            if step_time == req.deadline + 1:
                 sla_sum += req.priority
                 self._metrics.on_sla_violation(req)
         return sla_sum
 
-    def _is_episode_done(self) -> bool:
-        return self._current_time >= MAX_EPISODE_STEPS
+    def _queued_wait_sum(self, step_time: int) -> float:
+        return float(
+            sum(step_time - r.arrival_time for r in self._queue)
+            + sum(step_time - r.arrival_time for r in self._preempted_queue)
+        )
 
+    def _count_prefills_this_step(self) -> int:
+        return sum(1 for r in self._active_batch if r.stage == RequestStage.PREFILL)
+
+    def _prefill_steps(self, prompt_tokens: int) -> int:
+        return max(1, ceil(prompt_tokens / PREFILL_TOKENS_PER_STEP))
+
+    def _unfinished_requests(self) -> list[Request]:
+        return self._active_batch + self._queue + self._preempted_queue
+
+    def _unfinished_count(self) -> int:
+        return len(self._active_batch) + len(self._queue) + len(self._preempted_queue)
+
+    def _unfinished_priority_sum(self) -> float:
+        return float(sum(req.priority for req in self._unfinished_requests()))
+
+    def _hit_time_limit(self) -> bool:
+        return self._current_time >= self._max_episode_steps
+
+    def _is_episode_done(self) -> bool:
+        if self._hit_time_limit():
+            return True
+        if self._unfinished_count() > 0:
+            return False
+        return self._wg.is_exhausted(self._current_time)

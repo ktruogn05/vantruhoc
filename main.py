@@ -12,6 +12,7 @@ def main():
 
     if command == "train":
         from training.train import train
+
         train()
 
     elif command == "evaluate":
@@ -21,24 +22,25 @@ def main():
         model_path = sys.argv[2]
 
         from configs.default import EvalConfig
-        from core.workload import WorkloadGenerator
-        from env.llm_env import LLMEnvSimple
         from scheduler.rl_agent import RLScheduler
+        from training.env_factory import build_raw_env
         from training.evaluate import evaluate_scheduler
 
         config = EvalConfig()
-        wg = WorkloadGenerator(
-            arrival_rate=config.workload.arrival_rate, seed=config.workload.seed
-        )
-        env = LLMEnvSimple(workload_generator=wg, reward_weights=config.reward_weights)
+        env = build_raw_env(config.workload, config.reward_weights)
         scheduler = RLScheduler(model_path=model_path)
-        metrics = evaluate_scheduler(scheduler, env, n_episodes=config.n_episodes)
+        metrics = evaluate_scheduler(
+            scheduler,
+            env,
+            n_episodes=config.n_episodes,
+            seed_start=config.seed,
+        )
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
 
     elif command == "compare":
-        from scheduler.fcfs import FCFSScheduler
         from scheduler.edf import EDFScheduler
+        from scheduler.fcfs import FCFSScheduler
         from scheduler.priority import PriorityScheduler
         from training.evaluate import compare_all
 
@@ -48,9 +50,9 @@ def main():
             "Priority": PriorityScheduler(),
         }
 
-        # If model path provided, add RL scheduler
         if len(sys.argv) >= 3:
             from scheduler.rl_agent import RLScheduler
+
             schedulers["RL"] = RLScheduler(model_path=sys.argv[2])
 
         df = compare_all(schedulers)
@@ -66,46 +68,37 @@ def main():
 
 
 def _smoke_test():
-    """Quick sanity check: random policy for 1 episode."""
+    """Deterministic quality smoke test on a finite workload."""
     import numpy as np
-    from core.workload import WorkloadGenerator
-    from env.llm_env import LLMEnvSimple
-    from env.sb3_wrapper import SB3EnvWrapper
 
-    print("Creating environment...")
-    wg = WorkloadGenerator(arrival_rate=2.0, seed=42)
-    raw_env = LLMEnvSimple(workload_generator=wg)
-    env = SB3EnvWrapper(raw_env)
+    from configs.default import WorkloadConfig
+    from env.reward import RewardWeights
+    from scheduler.fcfs import FCFSScheduler
+    from training.env_factory import build_raw_env
+    from training.evaluate import evaluate_scheduler
 
-    print("Running random policy for 1 episode...")
-    obs, info = env.reset(seed=42)
-    total_reward = 0.0
-    steps = 0
+    workload = WorkloadConfig(
+        arrival_rate=0.2,
+        seed=42,
+        arrival_horizon=200,
+        max_arrivals=20,
+        prompt_len=(64, 256),
+        response_len=(16, 64),
+        deadline_slack=(200, 400),
+    )
+    env = build_raw_env(workload, RewardWeights())
+    metrics = evaluate_scheduler(FCFSScheduler(), env, n_episodes=1, seed_start=42)
 
-    while True:
-        mask = env.action_masks()
-        valid_actions = np.where(mask)[0]
-        action = int(np.random.choice(valid_actions))
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        steps += 1
+    print("Smoke-test metrics:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
 
-        if steps % 500 == 0:
-            print(f"  Step {steps}: reward={reward:.2f}, cumulative={total_reward:.2f}")
-
-        if terminated or truncated:
-            break
-
-    print(f"\nEpisode done in {steps} steps.")
-    print(f"Total reward: {total_reward:.2f}")
-    if info.get("episode_metrics"):
-        print("Episode metrics:")
-        for k, v in info["episode_metrics"].items():
-            print(f"  {k}: {v}")
-
-    # Verify basics
-    assert np.isfinite(total_reward), "Reward is not finite!"
-    assert steps <= 5000, f"Episode exceeded max steps: {steps}"
+    assert metrics["total_steps_mean"] <= 5000
+    assert np.isfinite(metrics["throughput_tokens_per_step_mean"])
+    assert metrics["requests_arrived_mean"] > 0
+    assert metrics["completion_rate_mean"] >= 0.95
+    assert metrics["requests_aborted_mean"] == 0
+    assert metrics["requests_unfinished_mean"] == 0
     print("\n[OK] Smoke test PASSED")
 
 

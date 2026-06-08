@@ -1,14 +1,16 @@
-"""Evaluation harness — run any scheduler on env, compare results."""
+"""Evaluation harness - run schedulers on shared workload configuration."""
 
 from __future__ import annotations
+
+from numbers import Number
 
 import pandas as pd
 
 from configs.default import EvalConfig
-from core.types import SchedulerAction, ActionType
-from core.workload import WorkloadGenerator
+from core.types import SchedulerAction
 from env.llm_env import LLMEnvSimple
 from scheduler.base import BaseScheduler
+from training.env_factory import build_raw_env
 
 
 def evaluate_scheduler(
@@ -17,7 +19,7 @@ def evaluate_scheduler(
     n_episodes: int = 10,
     seed_start: int = 0,
 ) -> dict:
-    """Run scheduler on env for n_episodes. Return aggregated metrics."""
+    """Run scheduler on env for n_episodes and return aggregated metrics."""
     all_summaries = []
 
     for ep in range(n_episodes):
@@ -26,29 +28,37 @@ def evaluate_scheduler(
 
         terminated = False
         truncated = False
+        info = {}
 
         while not (terminated or truncated):
             state = env.state_snapshot
             action: SchedulerAction = scheduler.select_action(state)
             _, _, terminated, truncated, info = env.step(action)
 
-        episode_metrics = info.get("episode_metrics", {})
+        episode_metrics = info.get("episode_metrics") or {}
         scheduler.on_episode_end(episode_metrics)
         all_summaries.append(episode_metrics)
 
-    # Aggregate across episodes
-    if not all_summaries:
+    return aggregate_metrics(all_summaries)
+
+
+def aggregate_metrics(summaries: list[dict]) -> dict:
+    if not summaries:
         return {}
 
-    keys = all_summaries[0].keys()
+    keys = sorted({key for summary in summaries for key in summary.keys()})
     aggregated = {}
     for key in keys:
-        values = [s[key] for s in all_summaries if s is not None]
-        if values:
-            aggregated[f"{key}_mean"] = sum(values) / len(values)
-            aggregated[f"{key}_min"] = min(values)
-            aggregated[f"{key}_max"] = max(values)
-
+        values = [
+            summary[key]
+            for summary in summaries
+            if isinstance(summary.get(key), Number)
+        ]
+        if not values:
+            continue
+        aggregated[f"{key}_mean"] = sum(values) / len(values)
+        aggregated[f"{key}_min"] = min(values)
+        aggregated[f"{key}_max"] = max(values)
     return aggregated
 
 
@@ -56,34 +66,21 @@ def compare_all(
     schedulers: dict[str, BaseScheduler],
     config: EvalConfig | None = None,
 ) -> pd.DataFrame:
-    """Run all schedulers on same workload config. Return comparison DataFrame."""
+    """Run all schedulers on the same workload config."""
     if config is None:
         config = EvalConfig()
 
     results = {}
-
     for name, scheduler in schedulers.items():
-        # Create fresh env for each scheduler (same config)
-        wg = WorkloadGenerator(
-            arrival_rate=config.workload.arrival_rate,
-            seed=config.workload.seed,
-        )
-        wg.set_distributions(
-            prompt_len=config.workload.prompt_len,
-            response_len=config.workload.response_len,
-            priority_weights=config.workload.priority_weights,
-            deadline_slack=config.workload.deadline_slack,
-        )
-        env = LLMEnvSimple(
-            workload_generator=wg,
-            reward_weights=config.reward_weights,
-        )
-
+        env = build_raw_env(config.workload, config.reward_weights)
         metrics = evaluate_scheduler(
-            scheduler, env, n_episodes=config.n_episodes, seed_start=config.seed
+            scheduler,
+            env,
+            n_episodes=config.n_episodes,
+            seed_start=config.seed,
         )
         results[name] = metrics
-        print(f"[{name}] done — {metrics.get('requests_completed_mean', 'N/A')} avg completed")
+        completed = metrics.get("requests_completed_mean", "N/A")
+        print(f"[{name}] done - {completed} avg completed")
 
-    df = pd.DataFrame(results).T
-    return df
+    return pd.DataFrame(results).T

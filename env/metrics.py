@@ -4,10 +4,13 @@ from core.types import Request
 
 
 class MetricsCollector:
-    """Collects episode-level stats. Does not affect training — only logging/comparison."""
+    """Collect episode-level stats for logging and scheduler comparison."""
 
     def __init__(self):
         self.reset()
+
+    def on_requests_arrived(self, count: int) -> None:
+        self._arrived += count
 
     def on_request_complete(self, request: Request, current_time: int) -> None:
         turnaround = current_time - request.arrival_time + 1
@@ -27,18 +30,23 @@ class MetricsCollector:
         self._total_steps += 1
         self._total_tokens_decoded += tokens_decoded
 
-    def get_summary(self) -> dict:
+    def get_summary(self, unfinished_count: int = 0) -> dict:
         """Return episode summary dict."""
         n_ttft = len(self._ttfts)
         n_turn = len(self._turnarounds)
-        total_requests = self._completed + self._aborted
+        total_requests = self._completed + self._aborted + unfinished_count
+        total_requests = max(total_requests, self._arrived)
 
         return {
             "total_steps": self._total_steps,
+            "requests_arrived": self._arrived,
             "requests_completed": self._completed,
             "requests_aborted": self._aborted,
+            "requests_unfinished": unfinished_count,
             "total_requests": total_requests,
             "completion_rate": self._completed / max(total_requests, 1),
+            "abort_rate": self._aborted / max(total_requests, 1),
+            "unfinished_rate": unfinished_count / max(total_requests, 1),
             "sla_violations": self._sla_violations,
             "avg_ttft": sum(self._ttfts) / max(n_ttft, 1),
             "avg_turnaround": sum(self._turnarounds) / max(n_turn, 1),
@@ -49,6 +57,7 @@ class MetricsCollector:
         }
 
     def reset(self) -> None:
+        self._arrived: int = 0
         self._ttfts: list[int] = []
         self._turnarounds: list[int] = []
         self._completed: int = 0

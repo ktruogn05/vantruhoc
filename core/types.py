@@ -43,6 +43,7 @@ class Request:
 
     # --- Mutable (updated during processing) ---
     stage: RequestStage | None = None
+    prefill_remaining: int = 0
     tokens_generated: int = 0
     swap_in_remaining: int = 0
     cpu_tokens_held: int = 0
